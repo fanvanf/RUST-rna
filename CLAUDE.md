@@ -1,0 +1,109 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Build & Development Commands
+
+```bash
+# Clone with submodules (required — tools are git submodules in deps/)
+git clone --recurse-submodules https://github.com/AI4S-YB/rust_brain.git
+
+# Check entire workspace compiles
+cargo check --workspace
+
+# Run all tests
+cargo test --workspace
+
+# Run a single test
+cargo test -p rb-core -- create_and_load_project
+
+# Lint (our crates only, deps capped to warn)
+RUSTFLAGS="--cap-lints=warn" cargo clippy -p rb-core -p rb-app -p rb-qc -p rb-trimming -p rb-deseq2 -- -D warnings
+
+# Format (our crates only, excludes submodule deps)
+cargo fmt -p rb-core -p rb-app -p rb-qc -p rb-trimming -p rb-deseq2
+
+# Run desktop app (requires: cargo install tauri-cli --locked)
+cd crates/rb-app && cargo tauri dev
+
+# Frontend-only preview (no Rust backend, uses mock API shim)
+cd frontend && python3 -m http.server 8090
+
+# Linux system deps for Tauri/WebView
+sudo apt install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev
+```
+
+## Architecture
+
+### Cargo Workspace (8 crates)
+
+**rb-core** — Core library with no tool dependencies. Defines:
+- `Module` trait (`#[async_trait]`) — the central abstraction all analysis modules implement: `id()`, `name()`, `validate()`, `async run()`
+- `Project` model — project directory management with `project.json`, per-run directories (`runs/{module}_{uuid8}/`)
+- `Runner` — async task executor that spawns modules via tokio, routes progress through mpsc channels, manages cancellation via JoinHandle abort
+
+**rb-app** — Tauri v2 binary. Wires everything together:
+- `AppState` holds `ModuleRegistry` (HashMap of `Arc<dyn Module>`) and `Runner`
+- 9 Tauri commands in `commands/`: project (create/open/list), modules (validate/run/cancel/get_result/list_runs), files (select_files/select_directory/read_table_preview)
+- Runner's progress callback emits `"run-progress"` Tauri events to frontend
+- Runner is created when a project is opened; accessing project goes through `runner.project()`
+
+**rb-qc** — Adapter wrapping fastqc-rs. Calls `fastqc_rs::analysis::process_file()` directly in `spawn_blocking`.
+
+**rb-deseq2** — Adapter wrapping DESeq2_rs. Calls `DESeqDataSet::from_csv()` → `.run()` → `.results(Contrast::LastCoefficient)` in `spawn_blocking`.
+
+**rb-trimming** — Adapter calling cutadapt-rs CLI as subprocess (`std::process::Command`). Cannot use library dep because cutadapt-core uses workspace dependency inheritance incompatible with external path deps.
+
+**rb-star-index** — Adapter invoking STAR_rs `star --runMode genomeGenerate` as a subprocess. Uses `BinaryResolver` for tool discovery (falls back to PATH). Streams stderr lines as `RunEvent::Log`.
+
+**rb-star-align** — Adapter invoking STAR_rs `star --runMode alignReads` per sample. Parses `Log.final.out` for mapping stats and merges per-sample `ReadsPerGene.out.tab` files into a single `counts_matrix.tsv` ready for DESeq2. Streams stderr and honours cooperative cancellation.
+
+**rb-ai** — AI orchestration crate. Owns provider adapters (OpenAI-compatible in Phase 1; Anthropic/Ollama gated behind features), tool registry (builtin Read-risk tools, module-derived `run_*` tools, Phase 3 stubs), chat session persistence at `<project>/chats/`, and the `run_turn` orchestrator loop. Depends on `rb-core`; does not depend on Tauri. Phase 1 ships single-module conversational execution with forward-compatible schema for Phases 2/3 — see `docs/superpowers/specs/2026-04-19-ai-chat-mode-design.md`.
+
+### Tool Submodules (deps/)
+
+Three git submodules in `deps/`: `fastqc-rs`, `cutadapt-rs`, `DESeq2_rs`. These are AI4S-YB org repos. rb-qc and rb-deseq2 reference them as path dependencies; rb-trimming uses the CLI binary.
+
+### Frontend (frontend/)
+
+Vanilla HTML/CSS/JS single-page app — no build step, no framework.
+
+- **Routing**: hash-based (`#qc`, `#differential`, etc.), `navigate()` function renders views into `#content`
+- **Charts**: ECharts 5 (replaced Plotly). Each module has chart render functions. `ECHART_THEME` constant for consistent styling.
+- **Tauri integration**: `window.__TAURI__.core.invoke()` for commands, `window.__TAURI__.event.listen()` for progress events. Browser-mode shim in `index.html` provides mock fallback for development without Rust backend.
+- **Design**: "Warm Botanical Lab" theme — light cream background, Zilla Slab headings, Karla body text, teal/coral/green accent palette.
+
+### Data Flow
+
+```
+Frontend invoke('run_module') → rb-app command → Runner.spawn()
+  → creates RunRecord (Pending→Running) → spawns tokio task
+  → adapter.run() calls tool library/subprocess
+  → Progress sent via mpsc → Runner forwards as Tauri emit('run-progress')
+  → completion updates RunRecord (Done/Failed) → emit('run-completed')
+```
+
+## Key Patterns
+
+- **Adding a new module**: Create `crates/rb-{name}/` implementing `Module` trait, register in `rb-app/src/main.rs` via `registry.register(Arc::new(...))`, add frontend view in `frontend/js/modules/{view-id}/view.js`, and add an entry to `MODULES` in `frontend/js/core/constants.js` with `backend: '<Module::id()>'` (frontend view id may differ from backend id — e.g. `differential` → `deseq2`). Modules should also override `params_schema()` (JSON Schema for the params the adapter accepts) and `ai_hint()` (short description of when to invoke) so the AI tool registry can auto-derive a `run_{id}` tool for the copilot.
+- **Frontend param contract**: `runModule(viewId)` → `collectModuleParams()` scans the current `.module-view` for `[data-param]` inputs/selects/textareas and `.file-drop-zone[data-param]` zones, then invokes `validate_params` / `run_module` with the module's `backend` id from `MODULES`. Each `data-param` attribute names the exact backend schema field. Number inputs are coerced to `Number`, checkboxes to `Boolean`. Drop-zones default to `string[]`; add `data-param-single` for scalar path fields (also makes the zone replace-on-drop instead of appending). Form fields with no `data-param` are ignored — useful for UI-only controls.
+- **Frontend action dispatch**: Views must not use inline `onclick="fn(...)"`. Buttons declare `data-act="<name>"` with optional `data-mod` / `data-table` etc. args, and the single delegated click handler in `core/events.js:dispatchAction` routes to the imported function. Known acts: `run-module`, `reset-form`, `collapsible-toggle`, `export-tsv`, `browse`/`clear` (settings), `project-new`/`project-open` (header menu). Extend by adding a case in `dispatchAction` + importing the function — never by reintroducing `window.*` globals.
+- **CPU-bound work**: Always wrap in `tokio::task::spawn_blocking` (adapters do this for tool calls)
+- **Params**: Passed as `serde_json::Value` — each adapter deserializes what it needs in `run()` and validates in `validate()`
+- **Project state**: Shared via `Arc<tokio::sync::Mutex<Project>>` between Runner and commands
+- **Adding a subprocess-based module**: Use `rb_core::binary::BinaryResolver` to discover the tool (never hardcode `Command::new("toolname")`); register the binary id + install hint in `KNOWN_BINARIES` in `rb-core/src/binary.rs` so it shows up in Settings.
+- **RunEvent channel**: modules emit `RunEvent::Progress` (progress bar) or `RunEvent::Log` (streaming stderr/stdout shown to user). The Runner forwards both to Tauri as `run-progress` and `run-log` events.
+- **Runner callbacks must all be wired**: `setup_runner` in `rb-app/src/commands/project.rs` installs three separate callbacks — `on_progress` → emits `run-progress`, `on_log` → emits `run-log`, `on_complete` → emits `run-completed` (Ok) or `run-failed` (Err). Missing any one silently breaks a class of UI feedback (e.g. a missing `on_complete` leaves the frontend stuck showing "Running" forever because the listener never fires).
+- **Cancellation**: modules receive a `CancellationToken` and must honour it. Subprocess-based modules use `tokio::select!` on `child.wait()` vs `cancel.cancelled()` and call `child.kill().await` on cancel.
+- **View id vs backend id**: view ids use hyphens (`star-align`, `gff-convert`, `star-index`, `differential`); backend ids may differ (`star_align`, `gff_convert`, `star_index`, `deseq2`). `MODULES[i].id` is the view id; `MODULES[i].backend` is the backend id. Convention: **everything frontend-facing keys on the view id** — `state.runIdToModule[runId] = viewId` (not backend id), `renderLogPanel(viewId)` so `[data-log-panel="${viewId}"]` lookup works, and `${viewId}-runs` as the runs-panel container id. Only `api.invoke('validate_params' | 'run_module' | 'list_runs', ...)` uses the backend id. Mixing the two silently breaks log streaming and post-completion panel refresh.
+- **Frontend run feedback loop**: `runModule` in `core/actions.js` disables the run button, calls `validate_params` (which **returns** `Vec<ValidationError>` — does not throw; check `errors.length > 0` and surface to the user), then `run_module` to get a `runId`. It stores `state.runIdToModule[runId] = viewId` and calls `loadRunsForView(backendId, "${viewId}-runs")` immediately so the Running row appears without navigation. `runtime.js`'s `run-completed` / `run-failed` listeners refresh the same panel via `refreshRunsForRun(runId)`. Do not re-introduce `navigate(payload.module)` on completion — the payload carries no module id, and the old code passed a backend id to a view-id router.
+
+## CI/CD
+
+Workflow at `.github/workflows/ci.yml` triggers on `v*` tags only. Creates GitHub Release with platform artifacts (.deb, .AppImage, .dmg, .msi).
+
+```bash
+# Release a version
+git tag v0.2 -m "v0.2 — description"
+git push origin v0.2
+```
